@@ -38,8 +38,12 @@ extension Data {
 	}
 }
 
-class InMapper: Codable {
-	let nodes: Nodes
+class InMapper {
+	public var nodes: [Node] { _nodes.all }
+	public var edges: [Edge] { _edges.all }
+
+	private let _nodes: Nodes
+	private let _edges: Edges
 
 	enum CodingKeys: String, CodingKey {
 		case nodes
@@ -48,7 +52,8 @@ class InMapper: Codable {
 	let ping = Ping()
 
 	init() async throws {
-		self.nodes = try await Nodes()
+		self._nodes = Nodes()
+		self._edges = Edges()
 	}
 
 	/// Tests a node and that the next are as they say they are. '
@@ -56,114 +61,71 @@ class InMapper: Codable {
 	/// Returns: true if node is where expected.
 	@discardableResult
 	func test(_ node: Node) async -> Node? {
-		nil
+		fatalError("ToDo")
 	}
 
 	/// given an IP address determine tha path from this ipAddress to
 	/// the map.
 	@discardableResult
-	func test(_ ip: IpAddr) async -> Node? {
-		let candidates = nodes.get(ip)
-		switch candidates.count {
-			case 0:
-				return await full(ip)
-			case 1:
-				return await test(candidates[0])
-			default:
-				for node in candidates {
-					if await test(node) != nil {
-						return node
-					}
-				}
-				return nil
+	func test(_ ip: IpAddr) async throws -> Node? {
+		if let node = _nodes.match(ip) {
+			return await test(node)
+		} else {
+			return try await full(ip)
 		}
 	}
 
-	private func full(_ ip:IpAddr) async -> Node? {
+	private func full(_ ip:IpAddr) async throws -> Node? {
 		/// we agre just getting started with this IP address. First, make sure
 		/// it is actually threre otherwise the results are less interesting.
 		guard case .success = await ping.send(ip, 255) else {
-
 			return nil
 		}
 
-		var previous = nodes.root
+		var previous = _nodes.root
 		for i in (1 ... 255) {
-			var node:Node! = nil
 			let result = await ping.send(ip, i)
-			switch result {
+			let node = switch result {
 				case .success:
-					node = nodes.get(ip, i)
+					_nodes.get(ip)
 				case .ttlExceeded(let ip):
-					node = nodes.get(ip, i)
+					_nodes.get(ip)
 				case .unknown:
-					node = nodes.get(previous.ip+"->"+ip, i)
-				case .failed(_):
-					return nil
+					_nodes.get(previous.ip+"->next")
+				case .failed(let error):
+					throw "Failed \(error)"
 			}
-			previous.next.insert(node.id)
-			node.prev.insert(previous.id)
-			node.lastSeen = Date().timeIntervalSince1970
+			let date = Date().timeIntervalSince1970
+			let edge = _edges.get(previous.ip, node.ip)
+			edge.lastSeen = date
+			node.lastSeen = date
 			if case .success = result { return node }
 			previous = node
 		}
 		return nil
 	}
-}
 
+	var newNode: (Node) async throws -> () = {_ in }
+	var newEdge: (Edge) async throws -> () = {_ in }
 
-class Nodes: Codable {
-	let root: Node
-	private var nodes:[String: Node]
-
-	/// determine the most recent node with this ip address
-	func get(mostRecent ip: IpAddr) throws -> Node {
-		let nodes = self.get(ip)
-			.sorted{ $0.lastSeen > $1.lastSeen }
-		guard nodes.count > 0 else { throw "no mode by name"}
-		return nodes[0]
-	}
-
-	func get(_ ip:IpAddr) -> [Node] {
-		nodes.keys.compactMap {
-			if $0.split(separator: ";")[0] == ip {
-				return nodes[$0]
-			} else {
-				return nil
-			}
-		}
-		.sorted{ $0.depth < $1.depth }
-	}
-
-	func get(_ ip:IpAddr, _ depth:Int) -> Node {
-		if ip == "unknown" {
-			fatalError( "ToDo" )
-		}
-		if let node = nodes[Node.id(ip, depth)] {
-			return node
-		}
-		let node = Node(ip, depth)
-		nodes[node.id] = node
-		return node
-	}
-
-	init() async throws {
-		self.root = Node("root", 0)
-		self.nodes = [root.id: root]
-	}
 
 	/// returns the node names along the path from the root to the node
 	func path(_ ip:IpAddr) throws -> [Node] {
 
-		var pathNodes: [Node] = []
-
 		/// get the path from this node back to the root (if there are more than one  previous,
 		/// choose any one.
-		var currentNode = try get(mostRecent: ip)
-		while currentNode.prev.count > 0 {
+		guard var currentNode = _nodes.match(ip) else {
+			throw "node \(ip) not found"
+		}
+		var pathNodes = [Node]()
+		while true {
 			pathNodes += [currentNode]
-			let nextid = currentNode.prev.first!
-			currentNode = nodes[nextid]!
+			let edges = _edges.match(destination: currentNode.ip)
+			if edges.isEmpty { break }
+			guard let nextNode = _nodes.match(edges[0].source) else {
+				throw "node not found \(edges[0].source)"
+			}
+			currentNode = nextNode
 		}
 
 		/// reverse the list so that the index is the depth.
@@ -171,33 +133,141 @@ class Nodes: Codable {
 	}
 
 	var asDot: String {
-		"ToDo"
+		(
+			[ "digraph{"] +
+			nodes.map ({ """
+			   "\($0.ip)";
+			   """
+			}) +
+			edges.map({ """
+			   "\($0.source)"->"\($0.destination)";
+			   """
+			}) + ["}"]
+		).joined()
+	}
+
+}
+
+class Edges {
+	var set = Set<Edge>()
+
+	func get(_ source: IpAddr, _ destination: IpAddr) -> Edge {
+		if let edge = match(source, destination) {
+			return edge
+		}
+		let edge = Edge(source, destination)
+		set.insert(edge)
+		return edge
+	}
+
+	func match (_ source:IpAddr, _ destination:IpAddr) -> Edge? {
+		set.first { edge in
+			(edge.source == source &&
+			 edge.destination == destination)
+		}
+	}
+
+	func match (source:IpAddr? = nil, destination:IpAddr? = nil) -> [Edge] {
+		set.filter { edge in
+			if let source = source {
+				if source != edge.source { return false }
+			}
+			if let destination = destination {
+				if destination != edge.destination {
+					return false
+				}
+			}
+			return true
+		}
+	}
+
+	var all: [Edge] {
+		Array(set)
 	}
 }
 
-class Node : Codable {
-	let ip: IpAddr
-	let depth: Int
-	let firstSeen: Double
-	var lastSeen: Double
-	var next: Set<String> = []
-	var prev: Set<String> = []
 
-	static func id(_ ip:IpAddr, _ depth: Int) -> String {
-		"\(ip);\(depth)"
+class Edge: Hashable {
+	let source: String
+	let destination: String
+	var lastSeen: TimeInterval!
+
+	init(_ source: String, _ destination: String) {
+		self.source = source
+		self.destination = destination
 	}
 
-	nonisolated var id:String { Node.id(ip, depth) }
+	static func == (lhs: Edge, rhs: Edge) -> Bool {
+		lhs.source == rhs.source &&
+		lhs.destination == rhs.destination
+	}
 
-	init(_ ip: IpAddr, _ depth:Int) {
-		self.ip = ip
-		self.depth = depth
-		self.firstSeen = Date().timeIntervalSince1970
-		self.lastSeen = firstSeen
+	func hash(into hasher: inout Hasher) {
+		hasher.combine(source)
+		hasher.combine(destination)
+	}
+}
+
+
+class Nodes {
+
+	let root: Node
+	private var set: Set<Node>
+
+	func get(_ ip:IpAddr) -> Node {
+		if let node = match(ip) {
+			return node
+		}
+		/// Node not found, create one.
+		let node = Node(ip)
+		set.insert(node)
+		return node
+	}
+
+	init() {
+		self.root = Node("root")
+		self.set = []
+		self.set.insert(root)
+	}
+
+	func match(_ ip: IpAddr) -> Node? {
+		set.first { node in
+			node.ip == ip
+		}
+	}
+
+	var all: [Node] {
+		Array(set)
 	}
 
 	var asDot: String {
 		"ToDo"
+	}
+
+	var count:Int {
+		get {
+			set.count
+		}
+	}
+}
+
+class Node: Hashable {
+	let ip: IpAddr
+	let firstSeen: Double
+	var lastSeen: Double
+
+	init(_ ip: IpAddr) {
+		self.ip = ip
+		self.firstSeen = Date().timeIntervalSince1970
+		self.lastSeen = firstSeen
+	}
+
+	static func == (lhs: Node, rhs: Node) -> Bool {
+		lhs.ip == rhs.ip
+	}
+
+	func hash(into hasher: inout Hasher) {
+		hasher.combine(ip)
 	}
 }
 
